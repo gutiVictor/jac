@@ -1,6 +1,7 @@
 import re
 import unicodedata
 import warnings
+import io
 
 import pandas as pd
 import plotly.express as px
@@ -1208,6 +1209,92 @@ def mostrar_analisis_avanzado(dignatarios_rol: pd.DataFrame, df_juntas: pd.DataF
             else:
                 st.info("Datos insuficientes para Treemap.")
 
+def generar_excel_descarga(
+    df_juntas: pd.DataFrame, 
+    df_dignatarios: pd.DataFrame,
+    df_dignatarios_rol: pd.DataFrame,
+    estadistico: dict,
+    comunas: pd.DataFrame,
+    clave_muni: str | None
+) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # 1. Juntas de Acción Comunal
+        if not df_juntas.empty:
+            df_juntas.to_excel(writer, sheet_name='1. Juntas', index=False)
+        else:
+            pd.DataFrame({"Mensaje": ["No hay datos"]}).to_excel(writer, sheet_name='1. Juntas', index=False)
+            
+        # 2. Dignatarios
+        if not df_dignatarios.empty:
+            df_dignatarios.to_excel(writer, sheet_name='2. Dignatarios', index=False)
+        else:
+            pd.DataFrame({"Mensaje": ["No hay datos"]}).to_excel(writer, sheet_name='2. Dignatarios', index=False)
+            
+        # 3. KPIs Globales
+        if not df_juntas.empty:
+            total_afiliados = int(df_juntas["NUMERO_TOTAL_DE_AFILIADOS"].sum()) if "NUMERO_TOTAL_DE_AFILIADOS" in df_juntas.columns else 0
+            kpi_df = pd.DataFrame({
+                "Métrica": ["Total Juntas en base", "OAC Activas", "OAC Inactivas", "Total Afiliados Reportados"],
+                "Valor": [
+                    len(df_juntas),
+                    int((df_juntas['ESTADO'] == 'ACTIVO').sum()),
+                    int((df_juntas['ESTADO'] == 'INACTIVO').sum()),
+                    total_afiliados
+                ]
+            })
+            kpi_df.to_excel(writer, sheet_name='3. Resumen KPIs', index=False)
+            
+        # 4. Análisis OAC (Activas / Inactivas por municipio)
+        est = filtrar_estadistico_por_clave(estadistico, clave_muni) if clave_muni else estadistico
+        activos_est = est.get("oac_activas", pd.DataFrame())
+        inactivos_est = est.get("oac_inactivas", pd.DataFrame())
+        if not activos_est.empty and not inactivos_est.empty:
+            merge_oac = activos_est.merge(inactivos_est[["Municipio", "OAC_inactivas"]], on="Municipio", how="outer").fillna(0)
+            merge_oac["Total_OAC"] = merge_oac["OAC_activas"] + merge_oac["OAC_inactivas"]
+            merge_oac.to_excel(writer, sheet_name='4. OAC por Municipio', index=False)
+        else:
+            fallback = conteos_oac_desde_juntas(df_juntas)
+            if not fallback.empty:
+                fallback.to_excel(writer, sheet_name='4. OAC por Municipio', index=False)
+                
+        # 5. Análisis Sector y Denominación
+        if not df_juntas.empty and "SECTOR_NORM" in df_juntas.columns:
+            sector_counts = df_juntas["SECTOR_NORM"].value_counts().reset_index()
+            sector_counts.columns = ["Sector", "Cantidad"]
+            
+            if "DENOMINACION_NORM" in df_juntas.columns:
+                denom_counts = df_juntas["DENOMINACION_NORM"].value_counts().reset_index()
+                denom_counts.columns = ["Denominación", "Cantidad"]
+                sector_counts.to_excel(writer, sheet_name='5. Sector y Denominacion', index=False, startcol=0)
+                denom_counts.to_excel(writer, sheet_name='5. Sector y Denominacion', index=False, startcol=3)
+            else:
+                sector_counts.to_excel(writer, sheet_name='5. Sector y Denominacion', index=False)
+
+        # 6. Demografía Dignatarios
+        if not df_dignatarios_rol.empty:
+            comp_edad = conteo_por_grupo(df_dignatarios_rol, "Edad", orden=RANGOS_EDAD)
+            comp_gen = conteo_por_grupo(df_dignatarios_rol, "Genero", orden=GENEROS_ORDEN)
+            comp_esc = conteo_por_grupo(df_dignatarios_rol, "Escolaridad")
+            
+            if not comp_edad.empty:
+                comp_edad.to_excel(writer, sheet_name='6. Demografia Dignatarios', index=False, startcol=0)
+            if not comp_gen.empty:
+                comp_gen.to_excel(writer, sheet_name='6. Demografia Dignatarios', index=False, startcol=4)
+            if not comp_esc.empty:
+                comp_esc.to_excel(writer, sheet_name='6. Demografia Dignatarios', index=False, startcol=8)
+                
+        # 7. Datos Auxiliares (Jóvenes y Mujeres)
+        jm = est.get("jovenes_mujeres", pd.DataFrame())
+        if not jm.empty:
+            jm.to_excel(writer, sheet_name='7. Jovenes y Mujeres', index=False)
+            
+        # 8. Comunas
+        if not comunas.empty:
+            comunas.to_excel(writer, sheet_name='8. Comunas y Ediles', index=False)
+
+    return output.getvalue()
+
 def mostrar_kpis(df: pd.DataFrame):
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -1358,6 +1445,25 @@ def main():
     st.sidebar.header("Navegación")
     opciones = ["🌍 Vista global"] + [e for e, _ in MUNICIPIOS_MENU]
     seleccion = st.sidebar.radio("Municipio", opciones, label_visibility="collapsed")
+    
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Filtros Adicionales")
+    filtro_estado = st.sidebar.selectbox("Estado de OAC", ["Todos", "ACTIVO", "INACTIVO"], help="Filtra las organizaciones según su estado jurídico.")
+    filtro_sector = st.sidebar.selectbox("Sector", ["Todos", "Urbano", "Rural"], help="Filtra según el sector de la organización.")
+
+    # Aplicar filtros al DataFrame principal
+    if filtro_estado != "Todos":
+        df = df[df["ESTADO"] == filtro_estado]
+    if filtro_sector != "Todos":
+        df = df[df["SECTOR_NORM"] == filtro_sector]
+        
+    # Re-calcular los dignatarios si hubo filtrado
+    dignatarios_df = datos["dignatarios"]
+    dignatarios_rol_df = datos["dignatarios_rol"]
+    if filtro_estado != "Todos" or filtro_sector != "Todos":
+        dignatarios_df = dataframe_dignatarios(df)
+        dignatarios_rol_df = extraer_dignatarios_por_rol(df)
+
     st.sidebar.markdown("---")
     st.sidebar.subheader("Hojas cargadas")
     st.sidebar.dataframe(datos["resumen_hojas"], hide_index=True, use_container_width=True)
@@ -1371,13 +1477,13 @@ def main():
         mostrar_panel_sector_denominacion(df, clave=None)
         st.markdown("---")
         mostrar_panel_dignatarios(
-            df, datos["dignatarios"], datos["dignatarios_rol"], clave=None
+            df, dignatarios_df, dignatarios_rol_df, clave=None
         )
         st.markdown("---")
         mostrar_panel_auxiliares(datos["estadistico"], datos["comunas"], clave=None)
 
         st.markdown("---")
-        mostrar_analisis_avanzado(datos["dignatarios_rol"], df, clave=None)
+        mostrar_analisis_avanzado(dignatarios_rol_df, df, clave=None)
 
         st.markdown("---")
         st.subheader("Resumen por municipio (base de datos)")
@@ -1393,6 +1499,23 @@ def main():
                 }
             )
         st.dataframe(pd.DataFrame(resumen), hide_index=True, use_container_width=True)
+        
+        st.markdown("---")
+        st.subheader("📥 Exportar Datos")
+        excel_data = generar_excel_descarga(
+            df, 
+            dignatarios_df, 
+            dignatarios_rol_df, 
+            datos["estadistico"], 
+            datos["comunas"], 
+            clave_muni=None
+        )
+        st.download_button(
+            label="📥 Descargar Reporte Global (Excel Multi-hoja)",
+            data=excel_data,
+            file_name="Reporte_JAC_Global.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     else:
         clave = dict((e, c) for e, c in MUNICIPIOS_MENU)[seleccion]
@@ -1455,8 +1578,27 @@ def main():
             height=400,
             hide_index=True,
         )
+        
+        st.markdown("---")
+        st.subheader("📥 Exportar Datos del Municipio")
+        dignatarios_muni_df = dataframe_dignatarios(df_muni, clave_muni=clave)
+        dignatarios_rol_muni_df = extraer_dignatarios_por_rol(df_muni, clave_muni=clave)
+        excel_data_muni = generar_excel_descarga(
+            df_muni, 
+            dignatarios_muni_df, 
+            dignatarios_rol_muni_df, 
+            datos["estadistico"], 
+            datos["comunas"], 
+            clave_muni=clave
+        )
+        st.download_button(
+            label=f"📥 Descargar Reporte de {seleccion} (Excel Multi-hoja)",
+            data=excel_data_muni,
+            file_name=f"Reporte_JAC_{seleccion.replace(' ', '_')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
-    st.success(f"Archivo **{uploaded.name}** cargado.")
+    st.success(f"Archivo **{uploaded.name}** cargado con éxito.")
 
 
 if __name__ == "__main__":

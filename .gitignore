@@ -1,0 +1,21 @@
+# Entornos virtuales
+venv/
+env/
+.env/
+
+# Caché de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos de datos y binarios grandes
+*.xlsx
+*.xls
+*.csv
+*.rar
+*.zip
+
+# Variables de entorno y configuraciones locales
+.env
+.streamlit/secrets.toml

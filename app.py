@@ -88,6 +88,12 @@ ETIQUETAS_ROL = {
     "SUPLENTE_FISCAL": "Suplente fiscal",
 }
 
+# Roles que conforman la DIRECTIVA de la junta
+ROLES_DIRECTIVA = ["PRESIDENTE", "VICEPRESIDENTE", "TESORERO", "SECRETARIO"]
+
+# Roles que conforman el ORGANISMO DE CONTROL
+ROLES_CONTROL = ["FISCAL", "SUPLENTE_FISCAL"]
+
 SECTORES_ORDEN = ["Urbano", "Rural", "Sin clasificar", "Sin dato"]
 
 
@@ -1209,6 +1215,198 @@ def mostrar_analisis_avanzado(dignatarios_rol: pd.DataFrame, df_juntas: pd.DataF
             else:
                 st.info("Datos insuficientes para Treemap.")
 
+
+def extraer_directiva_control(df: pd.DataFrame, clave_muni: str | None = None) -> pd.DataFrame:
+    """Extrae una fila por cada cargo de directiva/control con nombre, cedula y municipio."""
+    if df.empty:
+        return pd.DataFrame()
+
+    cols = list(df.columns)
+    municipio_label = etiqueta_municipio(clave_muni) if clave_muni else None
+    filas = []
+
+    for _, row in df.iterrows():
+        muni = municipio_label or str(row.get("MUNICIPIO", row.get("MUNICIPIO_CLAVE", ""))).strip()
+        nombre_organismo_val = nombre_organismo(row)
+
+        for rol in (ROLES_DIRECTIVA + ROLES_CONTROL):
+            if rol not in cols:
+                continue
+
+            nombre_val = row.get(rol)
+            nombre_ok = (
+                pd.notna(nombre_val)
+                and str(nombre_val).strip() not in ("", "nan", "0", "None")
+                and str(nombre_val).strip().upper() not in ROLES_DIGNATARIOS
+            )
+            if not nombre_ok:
+                continue
+
+            # Buscar columna de cédula: primero CEDULA_P inmediatamente despues del rol,
+            # luego cualquier columna CEDULA en el bloque de ese rol
+            cedula_val = ""
+            try:
+                idx_rol = cols.index(rol)
+            except ValueError:
+                idx_rol = -1
+
+            if idx_rol >= 0:
+                # Buscar siguiente columna que tenga CEDULA en el nombre dentro de los próximos 10
+                bloque_busca = cols[idx_rol + 1 : idx_rol + 12]
+                for bc in bloque_busca:
+                    # Detener búsqueda si llegamos a otro rol
+                    if bc in ROLES_DIGNATARIOS:
+                        break
+                    bc_upper = bc.upper()
+                    if "CEDULA" in bc_upper or "CÉDULA" in bc_upper or bc_upper.startswith("CEDULA"):
+                        v = row.get(bc)
+                        if pd.notna(v) and str(v).strip() not in ("", "nan", "0", "None"):
+                            # Formatear como entero si es numérico
+                            try:
+                                cedula_val = str(int(float(str(v).strip())))
+                            except (ValueError, TypeError):
+                                cedula_val = str(v).strip()
+                            break
+
+            tipo = (
+                "Directiva"
+                if rol in ROLES_DIRECTIVA
+                else "Organismo de Control"
+            )
+
+            filas.append({
+                "Municipio": muni,
+                "Organismo": nombre_organismo_val,
+                "Tipo": tipo,
+                "Cargo": ETIQUETAS_ROL.get(rol, rol.replace("_", " ").title()),
+                "Cargo_clave": rol,
+                "Nombre": str(nombre_val).strip(),
+                "Identificacion": cedula_val,
+            })
+
+    return pd.DataFrame(filas)
+
+
+def mostrar_reporte_directiva_control(
+    df: pd.DataFrame,
+    clave: str | None,
+    cargos_habilitados: list[str],
+):
+    """Muestra el reporte de Directiva y Organismo de Control con filtros aplicados."""
+    st.markdown("### 📋 Directiva y Organismos de Control")
+
+    # Extraer datos
+    df_dir = extraer_directiva_control(df, clave_muni=clave)
+
+    if df_dir.empty:
+        st.info("No se encontraron datos de directiva o control en las columnas del Excel.")
+        return
+
+    # Aplicar filtro de cargos seleccionados
+    if cargos_habilitados:
+        df_dir = df_dir[df_dir["Cargo_clave"].isin(cargos_habilitados)]
+    else:
+        st.warning("⚠️ No hay ningún cargo seleccionado. Activa al menos uno en el panel de filtros.")
+        return
+
+    if df_dir.empty:
+        st.info("Sin datos para los cargos seleccionados.")
+        return
+
+    # ── Agrupamiento por municipio u organismo ──────────────────────────────────
+    if clave is None:
+        # Vista global → agrupar por municipio
+        municipios = df_dir["Municipio"].unique().tolist()
+        municipios.sort()
+
+        st.caption(f"{len(df_dir):,} registros en {len(municipios)} municipios")
+
+        for muni in municipios:
+            sub = df_dir[df_dir["Municipio"] == muni]
+            with st.expander(f"🏙️ {muni} — {len(sub)} registros", expanded=False):
+                _render_tablas_directiva_control(sub)
+    else:
+        # Vista municipio → agrupar por organismo
+        organismos = df_dir["Organismo"].unique().tolist()
+        organismos.sort()
+
+        st.caption(f"{len(df_dir):,} registros · {len(organismos)} organismos")
+
+        for org in organismos:
+            sub = df_dir[df_dir["Organismo"] == org]
+            with st.expander(f"🏛️ {org}", expanded=False):
+                _render_tablas_directiva_control(sub)
+
+    # Descarga rápida del reporte
+    st.markdown("---")
+    _cols_export = ["Municipio", "Organismo", "Tipo", "Cargo", "Nombre", "Identificacion"]
+    csv_bytes = df_dir[[c for c in _cols_export if c in df_dir.columns]].to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="📥 Descargar reporte directiva/control (CSV)",
+        data=csv_bytes,
+        file_name=f"directiva_control{'_' + etiqueta_municipio(clave) if clave else '_global'}.csv",
+        mime="text/csv",
+        key=f"dl_dir_{clave or 'global'}",
+    )
+
+
+def _render_tablas_directiva_control(sub: pd.DataFrame):
+    """Renderiza las dos tablas (Directiva / Organismo de Control) para un subconjunto."""
+    # CSS embebido para las tablas de estilo tipo planilla
+    css = """
+    <style>
+    .dir-table { border-collapse: collapse; width: 100%; font-size: 0.88rem; margin-bottom: 18px; }
+    .dir-table th { background: #c0392b; color: white; padding: 7px 12px; text-align: left; }
+    .dir-table td { padding: 6px 12px; border-bottom: 1px solid #eee; }
+    .dir-table tr:nth-child(even) td { background: #fdf0ef; }
+    .ctrl-table { border-collapse: collapse; width: 100%; font-size: 0.88rem; margin-bottom: 18px; }
+    .ctrl-table th { background: #2c3e50; color: white; padding: 7px 12px; text-align: left; }
+    .ctrl-table td { padding: 6px 12px; border-bottom: 1px solid #eee; }
+    .ctrl-table tr:nth-child(even) td { background: #ecf0f1; }
+    .section-title { font-weight: 700; font-size: 1rem; margin: 10px 0 4px 0; color: #1b4f24; }
+    </style>
+    """
+
+    col1, col2 = st.columns(2)
+
+    directiva = sub[sub["Tipo"] == "Directiva"][["Cargo", "Nombre", "Identificacion"]]
+    control = sub[sub["Tipo"] == "Organismo de Control"][["Cargo", "Nombre", "Identificacion"]]
+
+    with col1:
+        if not directiva.empty:
+            filas_html = "".join(
+                f"<tr><td>{r['Cargo']}</td><td>{r['Nombre']}</td><td>{r['Identificacion']}</td></tr>"
+                for _, r in directiva.iterrows()
+            )
+            html = (
+                css
+                + "<p class='section-title'>DIRECTIVA</p>"
+                + "<table class='dir-table'><thead><tr>"
+                + "<th>CARGO</th><th>NOMBRE</th><th>IDENTIFICACIÓN</th>"
+                + f"</tr></thead><tbody>{filas_html}</tbody></table>"
+            )
+            st.markdown(html, unsafe_allow_html=True)
+        else:
+            st.info("Sin datos de directiva para este organismo.")
+
+    with col2:
+        if not control.empty:
+            filas_html = "".join(
+                f"<tr><td>{r['Cargo']}</td><td>{r['Nombre']}</td><td>{r['Identificacion']}</td></tr>"
+                for _, r in control.iterrows()
+            )
+            html = (
+                css
+                + "<p class='section-title'>ORGANISMO DE CONTROL</p>"
+                + "<table class='ctrl-table'><thead><tr>"
+                + "<th>CARGO</th><th>NOMBRE</th><th>IDENTIFICACIÓN</th>"
+                + f"</tr></thead><tbody>{filas_html}</tbody></table>"
+            )
+            st.markdown(html, unsafe_allow_html=True)
+        else:
+            st.info("Sin datos de organismos de control para este organismo.")
+
+
 def generar_excel_descarga(
     df_juntas: pd.DataFrame, 
     df_dignatarios: pd.DataFrame,
@@ -1292,6 +1490,14 @@ def generar_excel_descarga(
         # 8. Comunas
         if not comunas.empty:
             comunas.to_excel(writer, sheet_name='8. Comunas y Ediles', index=False)
+
+        # 9. Directiva y Organismos de Control
+        df_dir_ctrl = extraer_directiva_control(df_juntas, clave_muni=clave_muni)
+        if not df_dir_ctrl.empty:
+            export_cols = ["Municipio", "Organismo", "Tipo", "Cargo", "Nombre", "Identificacion"]
+            df_dir_ctrl[[c for c in export_cols if c in df_dir_ctrl.columns]].to_excel(
+                writer, sheet_name='9. Directiva y Control', index=False
+            )
 
     return output.getvalue()
 
@@ -1445,18 +1651,43 @@ def main():
     st.sidebar.header("Navegación")
     opciones = ["🌍 Vista global"] + [e for e, _ in MUNICIPIOS_MENU]
     seleccion = st.sidebar.radio("Municipio", opciones, label_visibility="collapsed")
-    
+
     st.sidebar.markdown("---")
-    st.sidebar.subheader("Filtros Adicionales")
+    st.sidebar.subheader("⚙️ Filtros Generales")
     filtro_estado = st.sidebar.selectbox("Estado de OAC", ["Todos", "ACTIVO", "INACTIVO"], help="Filtra las organizaciones según su estado jurídico.")
     filtro_sector = st.sidebar.selectbox("Sector", ["Todos", "Urbano", "Rural"], help="Filtra según el sector de la organización.")
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📋 Filtros Reporte Directiva")
+    st.sidebar.caption("Activa o desactiva los cargos que deseas ver en el reporte de Directiva y Control.")
+
+    # ── Bloque Directiva ──────────────────────────────────────────────────────
+    st.sidebar.markdown("**Directiva**")
+    check_presidente   = st.sidebar.checkbox("Presidente",    value=True, key="chk_presidente")
+    check_vicepresidente = st.sidebar.checkbox("Vicepresidente", value=True, key="chk_vicepresidente")
+    check_tesorero     = st.sidebar.checkbox("Tesorero",     value=True, key="chk_tesorero")
+    check_secretario   = st.sidebar.checkbox("Secretario",   value=True, key="chk_secretario")
+
+    # ── Bloque Organismos de Control ──────────────────────────────────────────
+    st.sidebar.markdown("**Organismos de Control**")
+    check_fiscal       = st.sidebar.checkbox("Fiscal",           value=True, key="chk_fiscal")
+    check_suplente_fiscal = st.sidebar.checkbox("Suplente Fiscal", value=True, key="chk_suplente")
+
+    # Construir lista de cargos habilitados
+    cargos_habilitados = []
+    if check_presidente:       cargos_habilitados.append("PRESIDENTE")
+    if check_vicepresidente:   cargos_habilitados.append("VICEPRESIDENTE")
+    if check_tesorero:         cargos_habilitados.append("TESORERO")
+    if check_secretario:       cargos_habilitados.append("SECRETARIO")
+    if check_fiscal:           cargos_habilitados.append("FISCAL")
+    if check_suplente_fiscal:  cargos_habilitados.append("SUPLENTE_FISCAL")
 
     # Aplicar filtros al DataFrame principal
     if filtro_estado != "Todos":
         df = df[df["ESTADO"] == filtro_estado]
     if filtro_sector != "Todos":
         df = df[df["SECTOR_NORM"] == filtro_sector]
-        
+
     # Re-calcular los dignatarios si hubo filtrado
     dignatarios_df = datos["dignatarios"]
     dignatarios_rol_df = datos["dignatarios_rol"]
@@ -1480,6 +1711,8 @@ def main():
             df, dignatarios_df, dignatarios_rol_df, clave=None
         )
         st.markdown("---")
+        mostrar_reporte_directiva_control(df, clave=None, cargos_habilitados=cargos_habilitados)
+        st.markdown("---")
         mostrar_panel_auxiliares(datos["estadistico"], datos["comunas"], clave=None)
 
         st.markdown("---")
@@ -1488,8 +1721,8 @@ def main():
         st.markdown("---")
         st.subheader("Resumen por municipio (base de datos)")
         resumen = []
-        for etiqueta, clave in MUNICIPIOS_MENU:
-            sub = df[df["MUNICIPIO_CLAVE"] == clave]
+        for etiqueta, clave_iter in MUNICIPIOS_MENU:
+            sub = df[df["MUNICIPIO_CLAVE"] == clave_iter]
             resumen.append(
                 {
                     "Municipio": etiqueta,
@@ -1499,15 +1732,15 @@ def main():
                 }
             )
         st.dataframe(pd.DataFrame(resumen), hide_index=True, use_container_width=True)
-        
+
         st.markdown("---")
         st.subheader("📥 Exportar Datos")
         excel_data = generar_excel_descarga(
-            df, 
-            dignatarios_df, 
-            dignatarios_rol_df, 
-            datos["estadistico"], 
-            datos["comunas"], 
+            df,
+            dignatarios_df,
+            dignatarios_rol_df,
+            datos["estadistico"],
+            datos["comunas"],
             clave_muni=None
         )
         st.download_button(
@@ -1541,6 +1774,8 @@ def main():
             extraer_dignatarios_por_rol(df_muni, clave_muni=clave),
             clave=clave,
         )
+        st.markdown("---")
+        mostrar_reporte_directiva_control(df_muni, clave=clave, cargos_habilitados=cargos_habilitados)
         st.markdown("---")
         mostrar_panel_auxiliares(datos["estadistico"], datos["comunas"], clave=clave)
 
